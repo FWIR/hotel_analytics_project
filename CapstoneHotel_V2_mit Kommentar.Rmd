@@ -1,0 +1,965 @@
+---
+title: "Hotel Report +"
+author: "Hotelics"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+    toc: true
+---
+
+```{r setup, include=FALSE}
+options(scipen=999)
+```
+# Einführung
+Lieber Ivo,
+
+dieses Dokument beinhaltet die Resultate unseres Capstone Projektes. Im ersten
+Teil wird die Erstellung der Klassifikatoren beschrieben, während der 
+zweite Teil ein beispielhafter Hotelbericht beinhaltet,der Hotelics seinen Kunden anbietet.
+
+***
+
+# Modelle kreieren
+
+## Sentiment Modell
+
+Im ersten Schritt wird die Datei eingelesen und ein Überblick über die Daten verschafft.
+```{r warning=FALSE}
+library(data.table)
+reviews = fread("Hotel_Reviews.csv")
+```
+
+Wir versuchen nun das Land der Hotels herauszufinden. Dies tun wir anhand des Längen- und Breitengrades. Dafür müssen wir aber noch die NA's bei diesen Werten entfernen.
+
+```{r warning=FALSE}
+library(maps)
+
+# Da gewisse Längen- oder Breitengrade NAs enthalten, müssen diese entfernt werden. Da es sich um sehr wenige vom Datensatz handelt, spielt dies keine Rolle.
+reviews = reviews[!is.na(reviews$lat) | !is.na(reviews$lng),]
+
+# Library erkennt das Land anhand der Längen- und Breitengrade.
+reviews$Country = map.where(database="world", reviews$lng, reviews$lat)
+
+# zur Bearbeitung des Datensatz werden nur Einträge zu Hotels aus Österreich genommen
+reviews = reviews[reviews$Country == "Austria",]
+```
+
+Um die Kommentare zu verarbeiten und zu analysieren, werden sie hier proprocessed.
+```{r warning=FALSE}
+library(SentimentAnalysis)
+
+# Sentiment der negativen und positiven Reviews werden berechnet und zu jedem Kommentar gespeichert.
+reviews$Negative_Review_Sentiment = analyzeSentiment(reviews$Negative_Review)$SentimentQDAP
+reviews$Positive_Review_Sentiment = analyzeSentiment(reviews$Positive_Review)$SentimentQDAP
+
+# Nun soll die Performance überprüft werden. Da hier keine klassische Klassifikation vorliegt, 
+# wird eine eigene Confusiomatrix erstellt.
+# Sentimen QDAP > 0 bedeutet positiv.
+table_neg = table(reviews$Negative_Review_Sentiment <= 0) # Wie viele wurden richtig klassifiziert und wie viele nicht.
+table_pos = table(reviews$Positive_Review_Sentiment >= 0) # Wie viele wurden richtig klassifiziert und wie viele nicht.
+
+tp = table_pos["TRUE"]
+tn = table_neg["TRUE"]
+fp = table_pos["FALSE"]
+fn = table_neg["FALSE"]
+
+# anhand der eigens erstellten Confusion Matrix können die Accuracy, Recall und Precision berechnet werden.
+accuracy  = (tp + tn) / (tp + tn + fn + fp)
+recall    = (tp) / (tp + fn)
+precision = (tp) / (tp + fp)
+
+```
+
+Bei der Berechnung der Confusion Matrix dieses "Modells" werden keine Trainings- und Testdaten unterschieden, da wir lediglich eine Library verwenden, die einen Dictionary für die Sentiment-Analyse nutzt. Darum gibt es keinen Overfit auf die "Trainingsdaten".
+
+Die Bewertungsmassstäbe des Klassifikators sind die folgenden:
+
+* Accuracy:   `r accuracy`
+* Recall:     `r recall`
+* Precision:  `r precision`
+
+Nach der Analyse der Sentiments kann festgehalten werden, dann das Sentiment-Modell mit der Library SentimentAnalysis und dem QDAP-Sentiment ziemlich gut funktioniert. Mit einer solchen Accuracy kann sehr gut weitergearbeitet werden.
+
+## Topic Model
+
+Bevor wir das Topic Model trainieren, werden die Daten noch gesplittet. Dies, weil es dadurch einfacher wird, das Modell korrekt zu erlernen mit allen möglichen Datensätzen. Dieser Schritt wurde im Nachhinein und nach häufigem Ausprobieren erstellt.
+Es wird das Reviews DataFrame gesplittet. Negative und positive Kommentare werden getrennt. Der Grund dafür ist, dass wir so einzelne unnötige Kommentare wie "No Negative" rausnehmen können. Diese tragen keinen Inhalt bei und verändern die Topics.
+```{r warning=FALSE}
+####################################
+# splitNegativeAnsPositiveReviews
+#
+# Diese Funktion wird gebraucht, um die Datenstruktur (pro Zeile jeweils einen positiven und negativen Review) für die Verwendung fürs Topic Modelling zu verbessern.
+# Positive und negative Reviews werden in einzelne DataFrames aufgeteilt. So erhält man eine einheitliche Struktur des DataFrames. Das vereinfacht das spätere Handling enorm.
+# Diese Funktion kann später wiederverwendet werden.
+# 
+####################################
+splitNegativeAndPositiveReviews = function(splittable_reviews){
+  negatives = splittable_reviews
+  positives = splittable_reviews
+  
+  # im negativen Review-DataFrame löschen wir die positiven Kommentare und deren Sentiment heraus
+  negatives$Positive_Review = NULL
+  negatives$Review_Total_Positive_Word_Counts = NULL
+  negatives$Positive_Review_Sentiment = NULL
+  colnames(negatives)[colnames(negatives) == "Negative_Review"] = "Review"
+  colnames(negatives)[colnames(negatives) == "Review_Total_Negative_Word_Counts"] = "Review_Total_Word_Counts"
+  colnames(negatives)[colnames(negatives) == "Negative_Review_Sentiment"] = "Review_Sentiment"
+  
+  # im negativen Review-DataFrame löschen wir die positiven Kommentare und deren Sentiment heraus
+  positives$Negative_Review = NULL
+  positives$Review_Total_Negative_Word_Counts = NULL
+  positives$Negative_Review_Sentiment = NULL
+  colnames(positives)[colnames(positives) == "Positive_Review"] = "Review"
+  colnames(positives)[colnames(positives) == "Review_Total_Positive_Word_Counts"] = "Review_Total_Word_Counts"
+  colnames(positives)[colnames(positives) == "Positive_Review_Sentiment"] = "Review_Sentiment"
+  
+  return(list(negatives = negatives, positives = positives))
+  
+}
+
+# Die Reviews werden gesplittet und in einzelne DataFrames gespeichert
+splittedData = splitNegativeAndPositiveReviews(reviews)
+reviews.negative = splittedData$negatives
+reviews.positive = splittedData$positives
+
+
+```
+
+Die gesplitteten Daten werden nun bereinigt. Beispielsweise gibt es leere Kommentare oder solche, mit "No Negative" / "No Positive" als Inhalt. Da dies im Topic Modelling nichts nützt, werden diese entfernt.
+```{r warning=FALSE}
+
+####################################
+# removeNoiseData
+#
+# Diese Funktion wird gebraucht, um verzerrende Daten im Datensatz zu entfernen. Beispielsweise enthalten die Daten sehr häufig "no negative". Um zu verhindern, dass dies dann im Topic vorkommt, wird das entfernt. Obwohl es sehr viele solche Reviews im Datensatz hat, lohnt es sich die Daten zu entfernen, weil sie keinen inhaltlichen Mehrwert liefern.
+# Diese Funktion kann später wiederverwendet werden.
+# 
+####################################
+removeNoiseData = function(reviews.data){
+  reviews.prepared = reviews.data
+  
+  # NAs bei den Kommentaren werden entfernt.
+  reviews.prepared = reviews.prepared[!is.na(reviews.prepared$Review)]
+  # leere Kommentare werden entfernt
+  reviews.prepared = reviews.prepared[!(reviews.prepared$Review == "")]
+  # "no negative" Kommentare werden entfernt (sind extrem viele im Datensatz und verzerren das Modell)
+  reviews.prepared = reviews.prepared[!(tolower(reviews.prepared$Review) == "no negative")]
+  # "no positive" Kommentare werden entfernt (sind extrem viele im Datensatz und verzerren das Modell)
+  reviews.prepared = reviews.prepared[!(tolower(reviews.prepared$Review) == "no positive")]
+  # "nothing" Kommentare werden entfernt
+  reviews.prepared = reviews.prepared[!(tolower(reviews.prepared$Review) == "nothing")]
+
+  return (reviews.prepared)
+}
+
+# die Noise Daten werden aus den Reviews entfernt
+reviews.negative = removeNoiseData(reviews.negative)
+reviews.positive = removeNoiseData(reviews.positive)
+
+
+```
+
+Nun soll ein Topic Model trainiert werden. Dieses soll in den Daten verschiedene Topics erkennen.
+```{r warning=FALSE}
+
+# load libraries
+library(tm)
+library(topicmodels)
+library(reshape2)
+library(pals)
+
+####################################
+# preprocessData
+#
+# Mit dieser Funktion können auf wiederverwendbare Art und Weise die Daten vorverarbeitet werden. Das bedeutet, dass Zahlen, Sonderzeichen und Stoppwörter entfernt werden. Zudem werden die einzelnen Wörter gestemmt und in eine DocumentTermMatrix geladen.
+# Die DocumenttermMatrix ist für das Topic-Modelling notwendig.
+# 
+####################################
+preprocessData = function(data_to_preproceed){
+  # Alles was keine Buchstaben sind, wird entfernt
+  data_to_preproceed = gsub("[^A-Za-z]", " ", data_to_preproceed)
+  
+  # Corpus für die Reviews erstellen
+  data_to_preproceed = VectorSource(data_to_preproceed)
+  corpus.data = Corpus(data_to_preproceed)
+  
+  # Nun werden die Daten Preprocessed
+  corpus.data = tm_map(corpus.data, content_transformer(tolower)) # Hier wird alles zu lower_case umgewandelt.
+  corpus.data = tm_map(corpus.data, removeWords, stopwords("english")) # Englische Stopwörter entfernen
+  corpus.data = tm_map(corpus.data, stemDocument, language="english") # Stemming der Wörter
+  corpus.data = tm_map(corpus.data, stripWhitespace) # Nur noch einzelnen Leerzeichen
+  
+  # Kreieren einer Term Document Matrix
+  dtm.preprocessed = DocumentTermMatrix(corpus.data, control=list(weighting = weightTf))
+  dtm.preprocessed = removeSparseTerms(dtm.preprocessed, 0.9999) # Alle Worte, die in mehr als 99.99% der Dokumente nicht vorkommen entfernt werden. Dieser Wert wurde aufgrund der Anzahl vorhandener Sparse-Einträge so ausgesucht.
+
+  return (dtm.preprocessed)
+  
+}
+
+```
+
+```{r warning=FALSE}
+# Nun werden die positiven und negativen Reviews aneinandergehängt, um sie gemeinsam fürs Topic Modelling zu verwenden.
+all_reviews = append(reviews.negative$Review, reviews.positive$Review)
+
+# Alle Daten werden preprocessed
+dtm = preprocessData(all_reviews)
+
+# Leere Zeilen in der DTM sollen entfernt werden
+sel_idx = slam::row_sums(dtm) > 0 # Nur Zeilen auswählen, die Inhalt enthalten
+dtm = dtm[sel_idx, ] # Nur die auswählen, die auch Inhalt enthalten
+
+# Nun muss die Anzahl an Topics bestimmt werden. Hier müssen wir eine Annahme tätigen. Mehrere Versuche haben ergeben, dass 20 eine sinnvolle Zahl ist. Auch aus fachlicher Sicht, machen 20 Topics durchaus Sinn. Dadurch erfasst man viele Themen, allerdings sind sie noch analysierbar.
+anzahl_topics = 20
+# Aus 4 Wörtern soll der Topic-Name erzeugt werden.
+anzahl_woerter = 4
+
+# Nun berechnen wir das LDA Modell
+set.seed(123)
+topicModel = LDA(dtm, anzahl_topics, method="Gibbs", control=list(iter = 500, verbose = 25))
+topTermsPerTopic = terms(topicModel, anzahl_woerter)
+# Topic-Namen erzeugen
+topicNames = apply(topTermsPerTopic, 2, paste, collapse=" ")
+
+```
+
+An dieser Stelle werden nun anhand unseres Topic Modells die Themen der negativen Kommentare eruiert. Das wahrscheinlichste Thema wird in das Review DataFrame gespeichert.
+
+```{r warning=FALSE}
+##################################################
+# Topics für die negativen Kommentare herausfinden
+# An dieser Stelle werden nun für alle negativen Reviews die einzelnen Topics bestimmt.
+##################################################
+dtm.new_data = preprocessData(reviews.negative$Review)
+
+# Leere Zeilen in der DTM sollen entfernt werden
+sel_idx = slam::row_sums(dtm.new_data) > 0 # Nur Zeilen auswählen, die Inhalt enthalten
+dtm.new_data = dtm.new_data[sel_idx, ] # Nur die auswählen, die auch Inhalt enthalten
+
+# Die Reviews ohne zuordenbare Kommentar-Inhalte müssen rausgelöscht werden, damit später die Topics der Kommentare den Reviews zugewiesen werden können.
+reviews.negative = reviews.negative[sel_idx,]
+
+# Topics bestimmen
+predicted_topics = posterior(topicModel, dtm.new_data)
+
+####################################
+# getTopTopics
+#
+# Anhand der bestimmten Topics der einzelnen Kommentare wird mit dieser Funktion das wahrscheinlichste Topic ermittelt. Diese gilt als Topic eines Kommentars.
+# 
+####################################
+getTopTopics = function(topics_probabilities, topics){
+  # hier holen wir uns die Indexes der Hauptthemen der Kommentare
+  max.ind = apply(topics_probabilities,1,which.max)
+  return(topics[max.ind])
+}
+
+# Das Topic pro Kommentar ermitteln.
+toptopics = getTopTopics(predicted_topics$topics, topics = topicNames)
+
+reviews.negative$Topic = toptopics
+
+```
+
+Anschliessend werden anhand unseres Topic Modells die Themen der positiven Kommentare eruiert. Das wahrscheinlichste Thema wird in das Review DataFrame gespeichert. Eigentlich könnte man diese Kategorisierung auch in einem Schritt mit den negativen und positiven Kommentaren zusammen machen. Für die bessere Verständlichkeit für den Code, wurde dies aber getrennt gemacht. Für neue Hotels würde dies gleichzeitig gemacht werden (siehe unten).
+
+```{r warning=FALSE}
+##################################################
+# Topics für die positiven Kommentare herausfinden
+# An dieser Stelle werden nun für alle positiven Reviews die einzelnen Topics bestimmt.
+##################################################
+dtm.new_data = preprocessData(reviews.positive$Review)
+
+# Leere Zeilen in der DTM sollen entfernt werden
+sel_idx = slam::row_sums(dtm.new_data) > 0 # Nur Zeilen auswählen, die Inhalt enthalten
+dtm.new_data = dtm.new_data[sel_idx, ] # Nur die auswählen, die auch Inhalt enthalten
+
+# Die Reviews ohne zuordenbare Kommentar-Inhalte müssen rausgelöscht werden, damit später die Topics der Kommentare den Reviews zugewiesen werden können.
+reviews.positive = reviews.positive[sel_idx,]
+
+# Topics bestimmen
+predicted_topics = posterior(topicModel, dtm.new_data)
+
+# Das Topic pro Kommentar ermitteln.
+toptopics = getTopTopics(predicted_topics$topics, topics = topicNames)
+
+reviews.positive$Topic = toptopics
+```
+
+Nun konnten die Kommentare preprocessed werden und anhand der DocumentTermMatrix das Topic-Modelling erstellt werden. Hier wurden `r anzahl_topics` Topic bestimmt und mit je `r anzahl_woerter` Begriffen. Zudem wurden alle Kommentare dem wahrscheinlichsten Topic zugeordnet.
+
+An dieser Stellen haben wir also ein Sentiment-Modell und ein Topic-Modell, die bereits sehr gut funktionieren.
+
+Nachfolgend starten jetzt die Vorbereitungen für den Hotelbericht. Im nächsten Schritt das auszuwertende Hotel ausgewählt. Hier kann ein beliebiges Hotel aus unserem Datensatz ausgewählt werden. Wir es geändert, passt sich der Report entsprechend an. Das einzige was bei einem Hotel aus einem anderen Land ebenfalls geändert werden müsste, ist die Selektion der Datensätze im DataFrame reviews. Das geschieht zu Beginn dieses Files im zweiten Code Snippet.
+
+```{r warning=FALSE}
+#################################
+# ---------- Eingabe ------------
+#################################
+# In der Variable hotel_name kann festgelegt werden, welches Hotel ausgewertet werden soll.
+hotel_name = "Austria Trend Hotel Ananas Wien" # Falls der Bericht für ein anderes Hotel gewünscht wird, sollte dieser Name verändert werden.
+# In der Variable hotel.reviews können die zu analysierenden Reviews zugewiesen werden.
+hotel.reviews = reviews[reviews$Hotel_Name == hotel_name,] # An dieser Stelle nehmen wir die Kommentare eines Hotels und analysieren diese. In diesem Fall wählen wir ein Hotel aus dem Datensatz aus. Im realen Case könnte das Hotel hier sowohl positive als auch negative Kommentare vermischt aus dem CRM hochladen, um diese zu analysieren.
+#################################
+
+```
+
+An dieser Stelle wurde das Hotel `r hotel_name` ausgewählt, das analysiert werden soll.
+
+```{r warning=FALSE}
+# Diese Schritte müssen erledigt werden, weil wir ein Hotel aus unserem Datensatz verwenden. Würden andere Reviews analysiert werden, dann müsste dies auf einen anderen Weg erledigt werden.
+land_name = unique(hotel.reviews$Country) 
+land_reviews = rbind(reviews.negative[reviews.negative$Country == land_name], reviews.positive[reviews.positive$Country == land_name])
+
+```
+
+Anhand der Auswahl wurden auch das Land (`r land_name`) sowie die vorhandenen Reviews in diesem Land ermittelt. Die vorhandenen Reviews braucht es für das Hotel-Benchmarking.
+
+An dieser Stelle und als letzter Schritt der Vorbereitung für den Hotelbericht kann die Kundin / der Kunde die Vergleichshotels bestimmen. Dies könnte als Liste in die Variable eingegeben werden.
+
+```{r warning=FALSE}
+#################################
+# ---------- Eingabe ------------
+#################################
+# An dieser Stelle können unsere Kunden die Hotels auswählen, mit denen sie sich vergleichen möchten. Natürlich müssen wir von diesen bereits die Daten zu den Kommentaren haben.
+# Beispielhaft nehmen wir an dieser Stelle einfach 10 zufällige Hotels aus unserem Datensatz.
+n = nrow(unique(land_reviews[,"Hotel_Name"]))
+set.seed(123)
+index = sample(1:n, size = 10, replace=FALSE)
+hotel_vergleichsgruppe = unique(land_reviews[,"Hotel_Name"])[index,]
+#################################
+```
+
+In unserem Beispielfall wurden 10 zufällige Hotels aus dem Datensatz gewählt
+
+***
+
+# Hotelbericht für `r hotel_name`
+
+Sehr geehrter Herr Blohm,
+
+anbei finden Sie die monatliche "Hotel Report +" Auswertung des Hotels `r hotel_name`. Falls Sie Rückfragen haben oder weitere Auswertungen wünschen, steht Ihnen Ihr persönlicher Kundenberater **Calvin Limat** jederzeit zur Verfügung.
+
+Wir wünschen Ihnen eine interessanter Lektüre.
+
+Das "Hotel Report +" Team
+
+***
+
+```{r echo=FALSE, warning=FALSE, message = FALSE}
+# Die Daten werden gesplittet, damit nacher diese bereinigt werden können
+# Diese müssen vor allem gesplittet werden, weil sie so im Datensatz drin sind
+splitted_HotelData = splitNegativeAndPositiveReviews(hotel.reviews)
+hotel.negative = splitted_HotelData$negatives
+hotel.positive = splitted_HotelData$positives
+
+# Bereinigung der Daten
+hotel.negative = removeNoiseData(hotel.negative)
+hotel.positive = removeNoiseData(hotel.positive)
+
+# Zusammenführen der Daten
+hotel.all_reviews = append(hotel.negative$Review, hotel.positive$Review)
+
+# Das Dataset wird geshuffelt, um Korrelationen mit vorherigen Datensätzen zu verhindern
+# Dies war eine Vorsichtsmassnahme, aber wahrscheinlich nicht nötig
+rows = sample(length(hotel.all_reviews))
+hotel.all_reviews = hotel.all_reviews[rows]
+
+####################################
+# getTopicsForData
+#
+# Funktion um abhängig vom Text die Topic zurückzugeben mit der höchstenWahrscheinlichkeit.
+# 
+####################################
+getTopicsForData = function(tm, new_data){
+  
+  # Daten Preprocessen
+  dtm.new_data = preprocessData(new_data)
+  
+  # Leere Zeilen in der DTM sollen entfernt werden
+  sel_idx = slam::row_sums(dtm.new_data) > 0 # Nur Zeilenindex auswählen, von den Zeilen, die Wörter aus dem Vokabular enthalten
+  dtm.new_data = dtm.new_data[sel_idx, ] # Nur die auswählen, die auch Inhalt enthalten
+  
+  predicted_topics = posterior(tm, dtm.new_data) # Topics berechnen
+  
+  toptopic = getTopTopics(predicted_topics$topics, topics = topicNames) # Nur die Topic auswählen mit der höchsten Wahrscheinlichkeit
+  
+  # Return der Topics pro Kommentar, die Wörter (für die Wortwolke), index um diese Daten auch aus dem originalen Dataframe zu entfernen, damit diese keine 
+  # verfälschungen verursachen.
+  return(list(topics = toptopic, terms = predicted_topics$terms, index = sel_idx))
+  
+}
+
+# Topics aller Hotel Reviews berechnen
+topics_data = getTopicsForData(topicModel, hotel.all_reviews)
+
+# Nur die Reviews auswählen, zu denen Wörter aus dem Vokabular vorhanden waren
+# Sonst würden diese die Analyse verfälschen
+hotel.all_reviews = hotel.all_reviews[topics_data$index]
+
+# Sentiment aller Hotel Reviews berechnen
+hotel.sentiment = analyzeSentiment(hotel.all_reviews) 
+
+# Nun werden zu allen Reviews ihr Sentiment und ihre Topic gespeichert
+hotel.all_reviews = as.data.frame(hotel.all_reviews)
+hotel.all_reviews$topics = topics_data$topics
+hotel.all_reviews$sentiment = hotel.sentiment$SentimentQDAP
+
+```
+
+
+
+# 1) Vergleichsgruppe {#vergleichsgruppe}
+Um die Auswertungen aussagekräftiger zu machen, werden ihre Resultate immer auch mit einer Vergleichgruppe in Ihrer Nähe verglichen. Sie haben folgende Hotels in ihre Vergleichsgruppe hinzugefügt:
+
+```{r, echo=FALSE, results='asis'}
+# Ausgabe der Vergleichsgruppe
+knitr::kable(hotel_vergleichsgruppe)
+```
+
+Zudem wird das Hotel `r hotel_name` gegen alle Hotels in `r land_name` gebenchmarked.
+
+***
+
+# 2) Sentiment der Kommentare
+In der folgenden Grafik sehen sie auf einer Skala von -1 (negativ) bis +1 (positiv) die durchschnittliche Gefühlslage Ihrer Gäste. Zudem ist auch Ihre Vergleichsgruppe abgebildet, damit Sie Ihr Resultat mit der Konkurrenz vergleichen können.
+
+```{r echo=FALSE , warning=FALSE, message = FALSE}
+# Load ggplot2, wordcloud
+library(ggplot2)
+library(wordcloud)
+
+# Alle Reviews des Landes werden in ein datatable gespeichert
+dt_land_reviews = setDT(land_reviews)
+
+# Average Sentiment der einzelnen Hotels berechnen
+dt_avg_sentiment = dt_land_reviews[, .(avg_sentiment=mean(Review_Sentiment, rm.na=TRUE)),
+                             by=.(Hotel_Name)]
+    
+# Mean Sentiment des Hotels berechnen
+mean_sentiment_hotel = mean(hotel.all_reviews$sentiment, na.rm = TRUE)
+# Mean Sentiment der Vergleichsgruppe berechnen
+dt_avg_sentiment_vergleichgruppe = dt_avg_sentiment[is.element(dt_avg_sentiment$Hotel_Name, hotel_vergleichsgruppe$Hotel_Name),]
+# Mean Sentiment des Landes berechnen
+mean_sentiment_country = mean(dt_land_reviews$Review_Sentiment, na.rm = TRUE)
+
+# Erstellen des Dataframe Elements des Landes für die Darstellung im plot
+country_sentiment = data.frame(land_name, mean_sentiment_country)
+names(country_sentiment) = c("Hotel_Name", "avg_sentiment")
+
+# Erstellen des Dataframe Elements des Hotels für die Darstellung im plot
+hotel_sentiment = data.frame(hotel_name, mean_sentiment_hotel)
+names(hotel_sentiment) = c("Hotel_Name", "avg_sentiment")
+
+# Nun werden alle Daten gemerged um dann zusammen darzustellen
+dt_avg_sentiment_all = rbind(dt_avg_sentiment_vergleichgruppe, country_sentiment)
+dt_avg_sentiment_all = rbind(dt_avg_sentiment_all, hotel_sentiment)
+
+# Der Hotelname wird als Faktor gespeichert und nach Sentiment sortiert, damit
+# dies im Plot entsprechend angezeigt werden kann.
+dt_avg_sentiment_all$Hotel_Name = factor(dt_avg_sentiment_all$Hotel_Name, levels = dt_avg_sentiment_all$Hotel_Name[order(dt_avg_sentiment_all)])
+
+
+# Barplot erstellen über den Vergleich des Sentiments des Hotels mit den Vergeleichsgruppenhotels und dem Land
+plot= ggplot(dt_avg_sentiment_all, aes(x=reorder(Hotel_Name, -avg_sentiment), y=avg_sentiment, label=round(avg_sentiment,3), 
+                                   fill=factor(ifelse(Hotel_Name == land_name, "Land",
+                                                      ifelse(Hotel_Name==hotel_name,"Kunde","Wettbewerb"))))) +
+  geom_bar(stat = "identity", alpha=0.4, show.legend = TRUE, ) + geom_text(size=3, position = position_stack(vjust = 1.9)) +
+  scale_fill_manual(name = "Typ", values=c("red","blue","grey50")) +
+  coord_flip() + ggtitle("Vergleich Sentiment") + labs(x="", y="Durchschnittlicher Sentiment aller Kommentare") + ylim(-1,1)
+
+plot
+```
+
+***
+
+# 3) Gäste-Score
+Im der folgenden Grafik sehen sie auf einer Skala von 0 (schlecht) bis 10 (gut) die durchschnittliche vergebene Punktzahl Ihrer Gäste. Zudem ist auch Ihre Vergleichsgruppe abgebildet, damit Sie Ihr Resultat mit der Konkurrenz vergleichen können.
+
+```{r echo=FALSE}
+# Umwandeln aller Reviews in ein Data Table
+dt_reviews = setDT(reviews)
+
+# Average Score der einzelnen Hotels berechnen
+dt_avg_score = dt_reviews[, .(avg_score=mean(Average_Score)),
+                             by=.(Hotel_Name)]
+
+# Average Score des eigenen Hotels    
+dt_avg_score_hotel = dt_avg_score[dt_avg_score$Hotel_Name == hotel_name,]
+
+# Average Score der Hotels der VErgleichsgruppen
+dt_avg_score_vergleichgruppe = dt_avg_score[is.element(dt_avg_score$Hotel_Name, hotel_vergleichsgruppe$Hotel_Name),]
+
+# Diese anneinanderfügen, damit diese dann entsprechend dargestellt werden können.
+dt_avg_score_all = rbind(dt_avg_score_vergleichgruppe, dt_avg_score_hotel)
+
+# Durchschnittlicher Score des Landes berechnen
+mean_points_country = mean(dt_avg_score$avg_score)
+
+# Data Frame Elemente erstellen um dies dann darzustellen
+country_score = data.frame(land_name, mean_points_country)
+names(country_score) = c("Hotel_Name", "avg_score")
+
+# Zusammenführen der DAten
+dt_avg_score_all = rbind(dt_avg_score_all, country_score)
+
+# Sortieren der Hotels nach Score und speichern als Faktor, um dies entsprechend darzustellen
+dt_avg_score_all = dt_avg_score_all[order(dt_avg_score_all$avg_score)]
+dt_avg_score_all$Hotel_Name = factor(dt_avg_score_all$Hotel_Name, levels = dt_avg_score_all$Hotel_Name[order(dt_avg_score_all)])
+
+# Barplot des Durchschnittlichen Scores zwischen dem Hotel, dem Wettbewerb und dem Land
+plot= ggplot(dt_avg_score_all, aes(x=reorder(Hotel_Name, -avg_score), y=avg_score, label=round(avg_score,1), 
+                                   fill=factor(ifelse(Hotel_Name == land_name, "Land", ifelse(Hotel_Name==hotel_name,"Kunde","Wettbewerb"))))) +
+geom_bar(stat = "identity", alpha=0.4, show.legend = TRUE, ) + geom_text(size=3, position = position_stack(vjust = 0.5)) +
+scale_fill_manual(name = "Typ", values=c("red","blue","grey50")) +
+coord_flip() + ggtitle("Vergleich Score des Hotels vs. Wettbewerber & Land") + labs(x="", y="Durchschnittliche Bewertung") + ylim(0,10)
+
+plot
+```
+
+***
+
+# 4) Text Mining
+## 4.1) Topic Analyse des Hotels
+
+Im Folgenden sehen Sie, welche Themen am meisten positiv und am meisten negativ genannt worden sind bei den Kommentaren Ihres Hotels. Dies ermöglicht es Ihnen, gezielt die positiven Punkte zu erhalten und die negativen zu Verbessern. 
+
+```{r echo=FALSE}
+# Umwandeln in Data Table aller reviews des eigenen Hotels
+dt_reviews_hotel = setDT(hotel.all_reviews)
+
+# Anzahl Kommentare pro Topic und das durchschnittliche Sentiment dazu berechnen.
+dt_topics = dt_reviews_hotel[, .(count = .N, sentiment_mean=mean(sentiment, na.rm=TRUE)),
+                             by=.(topics)]
+# Alle durchschnittlich negativen Topics
+negative_topics.hotel = dt_topics[dt_topics$sentiment_mean < 0]
+# Alle durchschnittlich positiven Topics
+positive_topics.hotel = dt_topics[dt_topics$sentiment_mean > 0]
+```
+
+In den unterstehenden Grafiken sehen Sie die positiven wie auch negativen Themen der Kommentare.
+
+### Negative Themen
+
+In der folgenden Grafik sehen Sie die negativen Themen in den Kommentaren. Zudem sehen Sie auf der X-Achse, wie oft das Thema in den Kommentaren vorkommt und auf der Y-Achse wie negativ das Sentiment ist. Sie sollten sich dabei auf die Themen rechts unten fokussieren, da sie ein tiefes Sentiment haben und oft vorkommen. Dies liefert erste Anhaltspunkte, was aus Kundensicht an Ihrem Hotel optimiert werden könnte.
+
+```{r echo=FALSE}
+# Um die Topics darzustellen, brauchen wir mindestens so viele Farben wie in der Variable anzahl_topics definiert.
+# Diese ermitteln wir über folgende Methode. Quelle: https://stackoverflow.com/questions/15282580/how-to-generate-a-number-of-most-distinctive-colors-in-r
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+set.seed(123)
+color = sample(color, anzahl_topics, replace = FALSE)
+
+```
+
+```{r echo=FALSE, fig.height = 8, fig.width = 6}
+# Dataframe zuweisen für die Visualisierung
+data = data.frame(negative_topics.hotel)
+
+# Plotten der Negativen Topics und die Anzahl Kommentare/Sentiment dazu
+plot = ggplot(data, aes(x=count, y=sentiment_mean, color=topics)) + geom_point( size = 5) +
+  scale_color_manual(values = color) +
+  ggtitle("Negative Themen und Sentiment/Anzahl Kommentare") + labs(x="Anzahl Kommentare", y="Sentiment", color = "Themen") +
+  theme(legend.title = element_text( size=7), legend.text=element_text(size=7), legend.position = "bottom")
+plot
+
+```
+
+In der folgenden Grafik sehen Sie die negativen Themen und die Anzahl an Kommentaren, in denen sie vorkommen. Die Grafik zeigt, wie häufig über welche negativen Themen berichtet wird.
+
+```{r echo=FALSE}
+
+# Plotten der Negativen Topics mit den Anzahl Kommentaren
+plot = ggplot(data, aes(x=reorder(topics, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="Red4", alpha=0.4) +
+  coord_flip() + ggtitle("Negative Themen und Anzahl Kommentare") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+
+```
+
+In der folgenden Grafik sehen Sie die negativen Themen und wie stark das negative Sentiment ist. Eine negativere Zahl (eine kleinere Zahl) des Sentimentes bedeutet, dass darüber negativer geschrieben wird. Daraus könnte abgeleitet werden, wie schlimm ein negatives Thema für die Kunden wirklich ist.
+
+```{r echo=FALSE}
+
+# Plotten der Negativen Topics mit dem Sentiment
+plot = ggplot(data, aes(x=reorder(topics, -sentiment_mean), y=sentiment_mean)) + 
+  geom_bar(stat = "identity", fill="Red4", alpha=0.4) +
+  coord_flip() + ggtitle("Negative Themen und Sentiment") + labs(x="Thema", y="Sentiment")
+plot
+```
+
+
+In der folgenden Grafik sehen Sie anhand einer Wortwolke, aus welchen Begriffen in den Kommentaren sich das häufigste negative Thema zusammensetzt. Diese Darstellung erweitert die Betrachtung der Themen, indem die mit dem Thema verbundenen Begriffe aufgezeigt werden. So können weitere Zusammenhänge der Themen mit Wörtern entdeckt werden.
+
+```{r echo=FALSE}
+#
+# Wordcloud der am meist genannten negativen Topic
+#
+# sortieren, damit die meist gennante negative Topic zuoberst ist
+negative_topics.hotel = negative_topics.hotel[order(-count)]
+# Auswählen der Topic, welche die Top negative Topic ist
+topicToViz = grep(negative_topics.hotel[1,topics], topicNames)[1] 
+# Auswahl der 40 häufigsten Wörter in diesem Thema
+top40terms = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+words = names(top40terms)
+# Die Wahrscheinlichkeit der 40 häufigsten Wörter herausholen
+probabilities = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+# Darstellen der Wordcloud
+mycolors = brewer.pal(8, "YlOrRd")
+wordcloud(words, probabilities, random.order = FALSE, color = mycolors)
+```
+
+### Positive Themen
+
+In der folgenden Grafik sehen Sie die positiven Themen in den Kommentaren. Zudem sehen Sie auf der X-Achse, wie oft das Thema in den Kommentaren vorkommt und auf der Y-Achse wie positiv das Sentiment ist. Sie sollten sich dabei auf die Themen rechts oben fokussieren, da sie ein gutes Sentiment haben und oft vorkommen. Diese können sehr gut kommuniziert werden. Zudem unterstützt diese Grafik in der Auswahl von Optimierungsmöglichkeiten. Dadurch, dass man erkennt, was den Kunden wichtig ist und positiv auffällt, kann man ableiten, was weiterhin so beibehalten oder allenfalls sogar noch etwas weiter optimiert werden soll.
+
+```{r echo=FALSE, fig.height = 8, fig.width = 6}
+# Dataframe zuweisen für die Visualisierung
+data = data.frame(positive_topics.hotel)
+
+# Plotten der positiven Topics mit dem Sentiment und der Anzahl Kommentare dazu
+plot = ggplot(data, aes(x=count, y=sentiment_mean, color=topics)) + geom_point( size = 5) +
+  ggtitle("Positive Themen und Sentiment/Anzahl Kommentare") + labs(x="Anzahl Kommentare", y="Sentiment", color = "Themen") +
+  scale_color_manual(values = color) +
+  guides(colour = guide_legend(nrow = 10, byrow = T, override.aes=list(size=4))) +
+  theme(legend.title = element_text( size=7), legend.text=element_text(size=7), legend.position = "bottom")
+plot
+
+```
+
+In der folgenden Grafik sehen Sie die positiven Themen und die Anzahl an Kommentaren, in denen sie vorkommen. Das soll helfen, herauszufinden, welche Themen von Personen häufig erwähnt werden.
+
+```{r echo=FALSE}
+
+
+# Plotten der positiven Topics und der Anzahl Kommentare
+plot = ggplot(data, aes(x=reorder(topics, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="Green4", alpha=0.4) + 
+  coord_flip() + ggtitle("Positive Themen und Anzahl Kommentare") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+
+```
+
+In der folgenden Grafik sehen Sie die positiven Themen und wie stark das positive Sentiment ist. Sie zeigt, wie positiv über die einzelnen Themen wirklich gesprochen wird.
+
+```{r echo=FALSE}
+
+# Plotten der positiven Topics und dem Sentiment
+plot = ggplot(data, aes(x=reorder(topics, -sentiment_mean), y=sentiment_mean)) + 
+  geom_bar(stat = "identity", fill="Green4", alpha=0.4) +
+  coord_flip() + ggtitle("Positive Themen und Sentiment") + labs(x="Thema", y="Sentiment")
+plot
+```
+
+
+In der folgenden Grafik sehen Sie anhand einer Wortwolke, aus welchen Begriffen sich das häufigste positive Thema zusammensetzt. Diese Darstellung erweitert die Betrachtung der Themen, indem die mit den Themen verbundenen Begriffe aufgezeigt werden. So können weitere Zusammenhänge der Themen mit Wörtern entdeckt werden.
+
+```{r echo=FALSE}
+#
+# Wordcloud der am meist genannten positiven Topic
+#
+# sortieren, damit die meist gennante positive Topic zuoberst ist
+positive_topics.hotel = positive_topics.hotel[order(-count)]
+# Auswählen der Topic, welche die Top positive Topic ist
+topicToViz = grep(positive_topics.hotel[1,topics], topicNames)[1] 
+# Auswahl der 40 häufigsten Wörter in diesem Thema
+top40terms = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+words = names(top40terms)
+# Die Wahrscheinlichkeit der 40 häufigsten Wörter herausholen
+probabilities = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+# Darstellen der Wordcloud
+mycolors = brewer.pal(8, "Greens")
+wordcloud(words, probabilities, random.order = FALSE, color = mycolors)
+```
+
+## 4.2) Topic Analyse der Vergleichsgruppe & des Landes
+Im folgenden sehen Sie, welche Punkte am meisten positiv und am meisten negativ genannt worden sind innerhalb Ihrer Vergleichsgruppe. Dies ermöglicht es Ihnen, Ihre Ergebnisse mit der Konkurrenz zu vergleichen.
+
+Die Interpretation und die Analyse ist dieselbe wie bei 4.1 und wird deshallb nicht nochmals in der gleichen Detaillierung ausgeführt.
+
+```{r echo=FALSE}
+# Umwandeln in Data Table
+dt_reviews_country = setDT(land_reviews)
+
+# Keine der Topics hatte einen mean sentiment von unter 0, da dies durch die Betrachtung des gesamten Landes geglättet wurde.
+# Darum werden nun diejenigen Topics angezeigt, welche am häufigsten negativ und positiv genannt wurden. 
+
+# Zählen, wie oft eine Topic negativ genannt wurde und dementsprechend sortieren. Zudem wird der Mean des Sentiments berechnet.
+neg_topics.land = dt_reviews_country[Review_Sentiment<0, .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                             by=.(Topic)][order(-count)]
+
+# Zählen, wie oft eine Topic positiv genannt wurde und dementsprechend sortieren. Zudem wird der Mean des Sentiments berechnet.
+pos_topics.land = dt_reviews_country[Review_Sentiment>0, .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                             by=.(Topic)][order(-count)]
+
+# Topics Vergleichsgruppe, wie oft sie genannt wurden und der Sentient Mean dieser Themen
+topics.vergleichsgruppe = dt_reviews_country[is.element(Hotel_Name, hotel_vergleichsgruppe$Hotel_Name),
+                                             .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                                             by=.(Topic)][order(-count)]
+```
+
+### Vergleichsgruppe
+
+Die Vergleichsgruppe konnten Sie selber wählen. Sie setzt sich in Ihrem Fall mit den bereits [oben](#vergleichsgruppe) aufgelisteten Hotels zusammen.
+
+#### Negative Themen
+
+Auch in diesem Abschnitt werden wieder die negativen Themen und ihre Anzahl Kommentare und Sentiments angezeigt. In der unten stehenden Grafik handelt es sich aber um die Themen in den Kommentaren zu ihrer Vergleichsgruppe. Das hilft herauszufinden, auf welche Themen die Kunden bei ihren Vergleichshotels negativ reagieren. Mit grosser Wahrscheinlichkeit achten die Kunden auch bei Ihnen auf diese Themen. Es wäre deshalb vermutlich von Vorteil, diese ebenfalls zu optimieren.
+
+```{r echo=FALSE, fig.height = 8, fig.width = 6}
+
+# Nur die durchschnittlich negativen Topics der Vergleichsgruppe auswähleb
+data = data.frame(topics.vergleichsgruppe[topics.vergleichsgruppe$sentiment_mean<0])
+
+# Plotten der Negativen Topics und Sentiment/Anzahl Kommentare dazu
+plot = ggplot(data, aes(x=count, y=sentiment_mean, color=Topic)) + geom_point( size = 5) +
+  scale_color_manual(values = color) +
+  ggtitle("Negative Themen und Sentiment/Anzahl Kommentare") + labs(x="Anzahl Kommentare", y="Sentiment", color = "Themen") +
+  theme(legend.position="bottom")
+plot
+```
+
+Auch hier wird etwas vertiefter aufgeschlüsselt, welches Thema wie viele Kommentare erhielt. Das hilft Ihnen dabei, die Themen entsprechend Ihren Bedürfnissen zu priorisieren.
+
+```{r echo = FALSE}
+# Plotten der Negativen Topics und Anzahl Kommentare dazu
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="Red4", alpha=0.4) +
+  coord_flip() + ggtitle("Negative Themen und Anzahl Kommentare") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+```
+
+Dasselbe gilt für die Grafik mit den Sentiments der Themen Sie soll Ihnen helfen, die Themen einzuschätzen.
+
+```{r echo = FALSE}
+# Plotten der Negativen Topics und Sentiment dazu
+plot = ggplot(data, aes(x=reorder(Topic, -sentiment_mean), y=sentiment_mean)) + 
+  geom_bar(stat = "identity", fill="Red4", alpha=0.4) +
+  coord_flip() + ggtitle("Negative Themen und Sentiment") + labs(x="Thema", y="Sentiment")
+plot
+```
+
+#### Positive Themen
+
+Neben den negativen Themen der Vergleichsgruppe ist es ebenfalls interessant zu sehen, was von den Kunden in der Vergleichsgruppe positiv bemerkt wird. Das könnte durchaus auch für Ihr Hotel relevant sein. Auf diese Themen achten die Kunden wahrscheinlich auch bei Ihrem Hotel. Es empfiehlt sich also, auch das zu optimieren.
+
+```{r echo=FALSE, fig.height = 8, fig.width = 6}
+# Auswahl der im durchschnitt positiven Topics der Vergleichsgruppe
+data = data.frame(topics.vergleichsgruppe[topics.vergleichsgruppe$sentiment_mean>0])
+
+# Plotten der Positiven Topics der Vergleichsgruppe und Sentiment/Anzahl Kommenare dazu
+plot = ggplot(data, aes(x=count, y=sentiment_mean, color=Topic)) + geom_point( size = 5) +
+  ggtitle("Positive Themen und Sentiment/Anzahl Kommentare dazu") + labs(x="Anzahl Kommentare", y="Sentiment", color = "Themen") +
+  scale_color_manual(values = color) +
+  guides(colour = guide_legend(nrow = 10, byrow = T, override.aes=list(size=4))) +
+  theme(legend.title = element_text( size=7), legend.text=element_text(size=7), legend.position="bottom")
+plot
+
+```
+
+Um dann die unterschiedlichen Topics etwas besser priorisieren zu können, zeigen wir Ihnen hier die Anzahl Kommentare der einzelnen Themen im Vergleich.
+
+```{r echo = FALSE}
+# Plotten der Positiven Topics und Anzahl Kommentare dazu
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="Green4", alpha=0.4) +
+  coord_flip() + ggtitle("Positive Themen und Anzahl Kommentare dazu") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+
+```
+
+Dasselbe zeigen wir Ihnen mit dem Sentiment. So finden Sie schnell heraus, wie positiv die Kunden über die Themen sprechen.
+
+```{r echo = FALSE}
+# Plotten der Positiven Topics und mean sentiment dazu
+plot = ggplot(data, aes(x=reorder(Topic, -sentiment_mean), y=sentiment_mean)) + 
+  geom_bar(stat = "identity", fill="Green4", alpha=0.4) +
+  coord_flip() + ggtitle("Positive Themen und Sentiment dazu") + labs(x="Thema", y="Sentiment")
+plot
+```
+
+### Land
+
+In diesem Teil des Berichts vergleichen wir Sie mit dem Land `r land_name`.
+
+Auf die Darstellung des Sentiments wird verzichtet, da sich dieses über den Landesdurchschnitt ausgleicht.
+
+#### Negative Themen 
+Als negative Themen zeigen wir Ihnen die zehn negativsten Themen des Landes.
+
+```{r echo=FALSE}
+# Die Top 10 negativen Themen des Landes auswählen. Diese wurden schon nach Anzahl Kommentaren sortiert.
+data = data.frame(neg_topics.land[1:10,])
+
+# Plotten der Top 10 negativen Topics und die Anzahl Kommentare dazu
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="Red4", alpha=0.4) +
+  coord_flip() + ggtitle("Top 10 negative Themen und Anzahl Kommentare dazu") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+```
+
+Diese Darstellung wird durch eine Wortwolke mit den negativen Themennamen ergänzt. Dies soll einen Überblick über die negativen Themen im Land verschaffen.
+
+```{r echo=FALSE}
+#
+# Wordcloud der am meist genannten negativen Topic
+#
+# sortieren, damit die meist gennante negative Topic des Landes zuoberst ist
+neg_topics.land = neg_topics.land[order(-count)]
+# Auswählen der Topic, welche die Top negative Topic ist
+topicToViz = grep(neg_topics.land[1,Topic], topicNames)[1] 
+# Auswahl der 40 häufigsten Wörter in diesem Thema
+top40terms = sort(predicted_topics$terms[topicToViz,], decreasing=TRUE)[1:40]
+words = names(top40terms)
+# Die Wahrscheinlichkeit der 40 häufigsten Wörter herausholen
+probabilities = sort(predicted_topics$terms[topicToViz,], decreasing=TRUE)[1:40]
+# Darstellen der Wordcloud
+mycolors = brewer.pal(8, "YlOrRd")
+wordcloud(words, probabilities, random.order = FALSE, color = mycolors)
+```
+
+#### Positive Themen
+
+Zum Vergleich mit den negativen Themen werden hier die zehn positivsten Themen dargestellt und die Anzahl Kommentare dazu.
+
+```{r echo=FALSE}
+# Auswahl der Top 10 der häufigst genannten positiven Topics
+data = data.frame(pos_topics.land[1:10,])
+
+# Plotten der Top 10 Positivste Themen und Anzahl Kommenare dazu
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count)) + 
+  geom_bar(stat = "identity", fill="green4", alpha=0.4) + 
+  coord_flip() + ggtitle("Top 10 Positive Themen und Anzahl Kommentare dazu") + labs(x="Thema", y="Anzahl Kommentare")
+plot
+```
+
+Auch hier werden die positiven Themennamen durch eine Wortwolke ergänzt.
+
+```{r echo=FALSE}
+#
+# Wordcloud der am meist genannten positiven Topic
+#
+# sortieren, damit die meist gennante positive Topic zuoberst ist
+pos_topics.land = pos_topics.land[order(-count)]
+# Auswählen der Topic, welche die Top positive Topic ist
+topicToViz = grep(pos_topics.land[1,Topic], topicNames)[1] 
+# Auswahl der 40 häufigsten Wörter in diesem Thema
+top40terms = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+words = names(top40terms)
+# Die Wahrscheinlichkeit der 40 häufigsten Wörter herausholen
+probabilities = sort(topics_data$terms[topicToViz,], decreasing=TRUE)[1:40]
+# Darstellen der Wordcloud
+mycolors = brewer.pal(8, "Greens")
+wordcloud(words, probabilities, random.order = FALSE, color = mycolors)
+```
+
+***
+
+# 5) Gästenationalität
+In der folgenden Auswertung finden Sie eine vertiefte Analyse basierend auf den Top 3 Touristen-Nationalitäten Ihres Landes. Damit können sie sicherstellen, dass Sie sich auf die wichtigsten Touristen ausrichten. Dadurch lässt sich das Problem reduzieren, dass der Kommentarstil je nach Nationalität unterschiedlich ist, was dazu führen kann, dass man auf die falsche Gruppe optimiert.
+
+
+Anbei finden Sie wiederum die gleiche Analyse von vorhin, begrenzt und aufgeteilt nach den Top 3 Gästenationalitäten.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Einlesen der Top Herkunftsländer von Touristen
+# Diese Information ist relevant, da nicht alle Besucher von Ländern gerne
+# Reviews hinterlassen. In diesem Datensatz sind verlässliche Informationen
+# über die Top Herkunftsländer von Touristen vorhanden
+library("readxl")
+top_origins = read_excel("Touristen_Herkunft.xlsx")
+
+# Nun können diese Informationen zu den Kommentaren gemerged werden
+hotel.reviews=merge(hotel.reviews,top_origins,by.x="Country", by.y="Country_of_Stay", all.x=TRUE)
+
+# Umwandeln in Data Table, wird später gebraucht für Group by Befehle
+dt_hotel_reviews = setDT(hotel.reviews)
+
+# Top 1, 2 und 3 Land bestimmen für die Ausgabe und weitere Verarbeitung 
+top_1_land = unique(dt_hotel_reviews$Top_1_Country)
+top_2_land = unique(dt_hotel_reviews$Top_2_Country)
+top_3_land = unique(dt_hotel_reviews$Top_3_Country)
+```
+
+## Top Nationen 
+Die drei Top Nationen von Touristen im Land `r land_name` sind:
+
+* 1. : `r top_1_land`
+* 2. : `r top_2_land`
+* 3. : `r top_3_land`
+
+## Negative Themen
+
+Pro Top Land werden in der nachfolgenden Grafik jeweils die Anzahl an negativen Kommentaren zu den einzelnen Themen dargestellt. Dies hilft herauszufinden, welche Besucher-Nationalitäten auf welche Themen besonders achten. Beispielsweise könnte damit pro Besuchergruppe geschaut werden, auf was sie besondern Wert legen. Dies könnte spezifisch für die Besuchergruppe optimiert werden.
+
+```{r echo=FALSE}
+# Alle negativen Kommentare der Top Nationen zu den einzelnen Topics und das durchschnittliche Sentiment dieser berechnen.
+# Dies wird gruppiert nach Topic und Reviewer Nationalität. Dies bedeutet, dass zu den einzelnen Ländern die negativen Kommentare pro Topic gezählt werden. 
+# Beispiel: Germany, bed clean pillow small, 356. sortiert nach der Anzahl der Kommentare.
+neg_topics.land = land_reviews[is.element(Reviewer_Nationality, c(top_1_land, top_2_land, top_3_land)) & Review_Sentiment < 0,
+                            .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                             by=.(Topic, Reviewer_Nationality)][order(Reviewer_Nationality, -count)]
+
+# Dataframe zuweisen für die Visualisierung
+data = data.frame(neg_topics.land)
+
+# Plotten der Topics und Anzahl negativer Kommentare dazu. Getrennt nach Länder.
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count, fill=Reviewer_Nationality, label=count)) + 
+  geom_bar(stat = "identity", alpha=0.4) + scale_fill_manual(name = "Länder", values=c("yellow","orange","red")) +
+  coord_flip() + ggtitle("Themen und Anzahl negativer Kommentare") + labs(x="Thema", y="Anzahl Kommentare") + 
+  geom_text(size=3, position = position_stack(vjust = 0.5))
+plot
+```
+
+## Positive Themen
+
+Die gleiche Darstellung zeigt sich nachfolgend für die Anzahl an positiven Kommentaren zu den einzelnen Themen.
+
+```{r echo=FALSE}
+# Alle positiven Kommentare der Top Nationen zu den einzelnen Topics und das durchschnittliche Sentiment dieser berechnen.
+# Dies wird gruppiert nach Topic und Reviewer Nationalität. Dies bedeutet, dass zu den einzelnen Ländern die positiven Kommentare pro Topic gezählt werden. 
+# Beispiel: Germany, close city center, 690. sortiert nach der Anzahl der Kommentare.
+pos_topics.land = land_reviews[is.element(Reviewer_Nationality, c(top_1_land, top_2_land, top_3_land)) & Review_Sentiment > 0,
+                            .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                             by=.(Topic, Reviewer_Nationality)][order(Reviewer_Nationality, -count)]
+
+# Dataframe zuweisen für die Visualisierung
+data = data.frame(pos_topics.land)
+
+# Plotten der Topics und Anzahl positiver Kommentare dazu. Getrennt nach Länder
+plot = ggplot(data, aes(x=reorder(Topic, -count), y=count, fill=Reviewer_Nationality, label=count)) + 
+  geom_bar(stat = "identity", alpha=0.4) + scale_fill_manual(name = "Länder", values=c("green","lightblue","blue")) +
+  coord_flip() + ggtitle("Themen und Anzahl Positive Kommentare") + labs(x="Thema", y="Anzahl Kommentare") + 
+  geom_text(size=3, position = position_stack(vjust = 0.5))
+plot
+
+```
+
+## Gesamtüberblick über die Themen
+
+Für die Analysen-Nerds findet sich anbei noch ein vertiefter Einblick über das durchschnittliche Sentiment der Themen und deren Häufigkeit nach Nationalität. Also welches Thema wie häufig mit welchem Sentiment von den jeweiligen Top-Ländern erwähnt wurde.
+
+```{r echo=FALSE, fig.height = 8, fig.width = 6}
+# Alle Kommentare der Top Nationen zu den einzelnen Topics und das durchschnittliche Sentiment dieser berechnen.
+# Dies wird gruppiert nach Topic und Reviewer Nationalität. Dies bedeutet, dass zu den einzelnen Ländern die positiven Kommentare pro Topic gezählt werden. 
+# Beispiel: Germany, wifi price expensive small, 800. sortiert nach der Anzahl der Kommentare.
+all_reviews.land = land_reviews[is.element(Reviewer_Nationality, c(top_1_land, top_2_land, top_3_land)),
+                            .(count = .N, sentiment_mean=mean(Review_Sentiment, na.rm=TRUE)),
+                             by=.(Topic, Reviewer_Nationality)][order(Reviewer_Nationality, -count)]
+
+# Dataframe zuweisen für die Visualisierung
+data = data.frame(all_reviews.land)
+
+# Plotten der Topics und Sentiment sowie Anzahl Kommentare dazu. Getrennt nach dem Land
+plot = ggplot(data, aes(x=count, y=sentiment_mean, color=Topic, shape=Reviewer_Nationality)) + geom_point( size = 5) +
+  ggtitle("Themen und Sentiment/Anzahl Kommentare pro Land") + labs(x="Anzahl Kommentare", y="Sentiment") +
+  scale_shape_manual(name = "Länder", values=c(3, 16, 17)) +  theme(legend.direction = "vertical", legend.box = "horizontal") +
+  scale_color_manual(values = color) +
+  guides(colour = guide_legend(nrow = 10, byrow = T, override.aes=list(size=4))) + theme(legend.position="bottom")
+
+plot
+```
+
